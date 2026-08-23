@@ -1,0 +1,1 @@
+detector ncspot for macos

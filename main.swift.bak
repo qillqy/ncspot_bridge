@@ -1,0 +1,307 @@
+import Foundation
+import AppKit
+import Cocoa
+import MediaPlayer
+
+// MARK: - Config
+
+func resolveSocketPath() -> String {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = ["ncspot", "info"]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    do {
+        try process.run()
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        for line in output.split(separator: "\n") {
+            if line.hasPrefix("USER_RUNTIME_PATH") {
+                let path = line.replacingOccurrences(of: "USER_RUNTIME_PATH", with: "")
+                    .trimmingCharacters(in: .whitespaces)
+                return path + "/ncspot.sock"
+            }
+        }
+    } catch {
+        FileHandle.standardError.write("could not run `ncspot info`: \(error)\n".data(using: .utf8)!)
+    }
+    let uid = getuid()
+    return "/tmp/ncspot-\(uid)/ncspot.sock"
+}
+
+let socketPath = resolveSocketPath()
+
+// MARK: - JSON model
+
+struct NcspotStatus: Decodable {
+    struct Playable: Decodable {
+        let title: String?
+        let artists: [String]?
+        let album: String?
+        let duration: Int?
+        let cover_url: String?
+    }
+
+    enum PlaybackState {
+        case playing, paused, stopped
+    }
+
+    struct Mode: Decodable {
+        let state: PlaybackState
+
+        private enum CodingKeys: String, CodingKey {
+            case Playing, Paused
+        }
+
+        init(from decoder: Decoder) throws {
+            if let container = try? decoder.container(keyedBy: CodingKeys.self) {
+                if container.contains(.Playing) { state = .playing; return }
+                if container.contains(.Paused) { state = .paused; return }
+            }
+            state = .stopped
+        }
+    }
+
+    let mode: Mode?
+    let playable: Playable?
+}
+
+// MARK: - Now Playing bridge
+
+final class NowPlayingBridge {
+
+    private var artworkCache: [String: MPMediaItemArtwork] = [:]
+
+    func update(from status: NcspotStatus) {
+    	guard let track = status.playable else {
+        	clear()
+        	return
+    	}
+
+    	// ==========================
+    	// DEBUG
+    	// ==========================
+    	print("====================================")
+    	print("Title   :", track.title ?? "Unknown")
+    	print("Artist  :", track.artists?.joined(separator: ", ") ?? "")
+    	print("Album   :", track.album ?? "")
+    	print("Cover   :", track.cover_url ?? "None")
+    	print("State   :", status.mode?.state ?? .stopped)
+
+    	var info: [String: Any] = [:]
+
+    	info[MPMediaItemPropertyTitle] = track.title ?? "Unknown"
+    	info[MPMediaItemPropertyArtist] = track.artists?.joined(separator: ", ") ?? ""
+    	info[MPMediaItemPropertyAlbumTitle] = track.album ?? ""
+
+    	if let durationMs = track.duration {
+        	info[MPMediaItemPropertyPlaybackDuration] = Double(durationMs) / 1000.0
+    	}
+
+    	// Penting agar aplikasi lain tahu metadata berubah
+    	info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = 0.0
+    	info[MPNowPlayingInfoPropertyPlaybackRate] =
+        	status.mode?.state == .playing ? 1.0 : 0.0
+
+    	let center = MPNowPlayingInfoCenter.default()
+
+    	switch status.mode?.state {
+    	case .playing:
+        	center.playbackState = .playing
+    	case .paused:
+        	center.playbackState = .paused
+    	default:
+        	center.playbackState = .stopped
+    	}
+
+    	if let coverUrlString = track.cover_url,
+       	   let url = URL(string: coverUrlString) {
+
+           loadArtwork(url: url) { artwork in
+            	var updatedInfo = info
+
+            	if let artwork = artwork {
+                	updatedInfo[MPMediaItemPropertyArtwork] = artwork
+            	}
+
+            	// Paksa refresh
+            	center.nowPlayingInfo = nil
+            	center.nowPlayingInfo = updatedInfo
+           }
+
+    	} else {
+
+        	// Paksa refresh
+        	center.nowPlayingInfo = nil
+        	center.nowPlayingInfo = info
+    	}
+}
+
+    func clear() {
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
+    }
+
+    private func loadArtwork(url: URL, completion: @escaping (MPMediaItemArtwork?) -> Void) {
+        if let cached = artworkCache[url.absoluteString] {
+            completion(cached)
+            return
+        }
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            guard let data = data, let image = NSImage(data: data) else {
+                completion(nil)
+                return
+            }
+            let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+            self.artworkCache[url.absoluteString] = artwork
+            DispatchQueue.main.async { completion(artwork) }
+        }.resume()
+    }
+}
+
+// MARK: - Remote command bridge (Control Center -> ncspot)
+
+func sendCommand(_ command: String) {
+    FileHandle.standardError.write("[remote] sending command: \(command)\n".data(using: .utf8)!)
+
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else {
+        FileHandle.standardError.write("[remote] failed to create socket\n".data(using: .utf8)!)
+        return
+    }
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let path = socketPath
+    withUnsafeMutableBytes(of: &addr.sun_path) { rawPtr in
+        let ptr = rawPtr.bindMemory(to: CChar.self)
+        path.withCString { cstr in
+            strncpy(ptr.baseAddress, cstr, path.utf8.count)
+        }
+    }
+    let size = MemoryLayout.size(ofValue: addr)
+    let result = withUnsafePointer(to: &addr) { ptr -> Int32 in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+            connect(fd, sockPtr, socklen_t(size))
+        }
+    }
+    if result == 0 {
+        let msg = command + "\n"
+        let written = msg.withCString { write(fd, $0, strlen($0)) }
+        if written < 0 {
+            FileHandle.standardError.write("[remote] write() FAILED, errno=\(errno) (\(String(cString: strerror(errno))))\n".data(using: .utf8)!)
+        } else if written != msg.utf8.count {
+            FileHandle.standardError.write("[remote] PARTIAL write: \(written)/\(msg.utf8.count) bytes\n".data(using: .utf8)!)
+        } else {
+            FileHandle.standardError.write("[remote] wrote \(written) bytes to \(path)\n".data(using: .utf8)!)
+        }
+        usleep(50_000) // give ncspot a moment to read before we hang up
+    } else {
+        FileHandle.standardError.write("[remote] connect() failed, errno=\(errno) (\(String(cString: strerror(errno))))\n".data(using: .utf8)!)
+    }
+    close(fd)
+}
+
+func setupRemoteCommands(bridge: NowPlayingBridge) {
+    let commandCenter = MPRemoteCommandCenter.shared()
+
+    commandCenter.playCommand.isEnabled = true
+    commandCenter.pauseCommand.isEnabled = true
+    commandCenter.togglePlayPauseCommand.isEnabled = true
+    commandCenter.nextTrackCommand.isEnabled = true
+    commandCenter.previousTrackCommand.isEnabled = true
+
+    commandCenter.playCommand.addTarget { _ in
+        FileHandle.standardError.write("[remote] playCommand fired\n".data(using: .utf8)!)
+        MPNowPlayingInfoCenter.default().playbackState = .playing
+        sendCommand("playpause"); return .success
+    }
+    commandCenter.pauseCommand.addTarget { _ in
+        FileHandle.standardError.write("[remote] pauseCommand fired\n".data(using: .utf8)!)
+        MPNowPlayingInfoCenter.default().playbackState = .paused
+        sendCommand("playpause"); return .success
+    }
+    commandCenter.togglePlayPauseCommand.addTarget { _ in
+        FileHandle.standardError.write("[remote] togglePlayPauseCommand fired\n".data(using: .utf8)!)
+        let center = MPNowPlayingInfoCenter.default()
+        center.playbackState = (center.playbackState == .playing) ? .paused : .playing
+        sendCommand("playpause"); return .success
+    }
+    commandCenter.nextTrackCommand.addTarget { _ in
+        FileHandle.standardError.write("[remote] nextTrackCommand fired\n".data(using: .utf8)!)
+        sendCommand("next"); return .success
+    }
+    commandCenter.previousTrackCommand.addTarget { _ in
+        FileHandle.standardError.write("[remote] previousTrackCommand fired\n".data(using: .utf8)!)
+        sendCommand("previous"); return .success
+    }
+}
+
+// MARK: - Socket listener loop
+
+func listenLoop() {
+    let bridge = NowPlayingBridge()
+    setupRemoteCommands(bridge: bridge)
+
+    while true {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { sleep(2); continue }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &addr.sun_path) { rawPtr in
+            let ptr = rawPtr.bindMemory(to: CChar.self)
+            socketPath.withCString { cstr in
+                strncpy(ptr.baseAddress, cstr, socketPath.utf8.count)
+            }
+        }
+        let size = MemoryLayout.size(ofValue: addr)
+        let connected = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                connect(fd, sockPtr, socklen_t(size))
+            }
+        }
+
+        guard connected == 0 else {
+            close(fd)
+            sleep(2)
+            continue
+        }
+
+        var buffer = Data()
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let n = read(fd, &chunk, chunk.count)
+            if n <= 0 { break }
+            buffer.append(contentsOf: chunk[0..<n])
+
+            while let newlineIndex = buffer.firstIndex(of: 0x0A) {
+                let line = buffer[buffer.startIndex..<newlineIndex]
+                buffer.removeSubrange(buffer.startIndex...newlineIndex)
+                if line.isEmpty { continue }
+                do {
+                    let status = try JSONDecoder().decode(NcspotStatus.self, from: Data(line))
+                    DispatchQueue.main.async { bridge.update(from: status) }
+                } catch {
+                    FileHandle.standardError.write("parse error: \(error)\n".data(using: .utf8)!)
+                }
+            }
+        }
+        close(fd)
+        bridge.clear()
+        sleep(1)
+    }
+}
+
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+
+let queue = DispatchQueue(label: "socket-listener")
+queue.async {
+    listenLoop()
+}
+
+app.run()
+
+
